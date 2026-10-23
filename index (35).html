@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Щепотка</title>
+<style>
+  :root {
+    --bg: #14181c; --panel: #1e252b; --text: #e9eef2; --muted: #8b99a4;
+    --pinch: #4ad6a7; --open: #5aa8ff;
+    color-scheme: dark;
+  }
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --bg: #eef2f5; --panel: #ffffff; --text: #14181c; --muted: #5a6872;
+      --pinch: #0f9d74; --open: #2570c9; color-scheme: light;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: env(safe-area-inset-top, 0px) 12px env(safe-area-inset-bottom, 0px);
+    display: flex; flex-direction: column; gap: 12px;
+  }
+  h1 { font-size: 20px; margin: 14px 0 0; font-weight: 650; }
+  .stage {
+    position: relative; width: 100%; aspect-ratio: 3 / 4; max-height: 62vh;
+    background: #000; border-radius: 14px; overflow: hidden;
+    border: 4px solid var(--open); transition: border-color .12s;
+  }
+  .stage.pinch { border-color: var(--pinch); }
+  video, canvas.overlay {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    object-fit: cover; transform: scaleX(-1);
+  }
+  .flash { position: absolute; inset: 0; background: #fff; opacity: 0; pointer-events: none; }
+  .flash.on { animation: fl .35s ease-out; }
+  @keyframes fl { from { opacity: .85; } to { opacity: 0; } }
+  .hud {
+    position: absolute; left: 10px; right: 10px; bottom: 10px;
+    display: flex; justify-content: space-between; gap: 8px;
+    font-size: 15px; font-weight: 600;
+  }
+  .hud span { background: rgba(0,0,0,.6); color: #fff; padding: 6px 10px; border-radius: 8px; }
+  button {
+    font: inherit; font-weight: 650; border: 0; border-radius: 12px;
+    padding: 14px; background: var(--pinch); color: #06241a; cursor: pointer;
+  }
+  button:focus-visible { outline: 3px solid var(--open); outline-offset: 2px; }
+  button[disabled] { opacity: .6; }
+  .zoom { background: var(--panel); border-radius: 12px; padding: 12px; }
+  .zoom p { margin: 0 0 8px; color: var(--muted); font-size: 14px; }
+  .bar { height: 12px; background: rgba(128,128,128,.25); border-radius: 6px; overflow: hidden; }
+  .bar i { display: block; height: 100%; width: 0; background: var(--pinch); }
+  #msg { color: var(--muted); font-size: 14px; margin: 0; min-height: 1.3em; }
+  .gallery { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; padding-bottom: 16px; }
+  .gallery img { width: 100%; border-radius: 8px; display: block; }
+</style>
+</head>
+<body>
+  <h1>Щепотка: сожмите большой и указательный пальцы</h1>
+
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas class="overlay" id="overlay"></canvas>
+    <div class="flash" id="flash"></div>
+    <div class="hud"><span id="state">Камера выключена</span><span id="count">Снимков: 0</span></div>
+  </div>
+
+  <button id="start">Включить камеру</button>
+  <p id="msg"></p>
+
+  <div class="zoom">
+    <p>Сила сжатия (меняется плавно)</p>
+    <div class="bar"><i id="level"></i></div>
+  </div>
+
+  <div class="gallery" id="gallery"></div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const PINCH_ON = 0.25;   // ниже: щепотка началась
+const PINCH_OFF = 0.40;  // выше: щепотка закончилась
+const CONFIRM_FRAMES = 2;
+const COOLDOWN_MS = 1500;
+
+const $ = id => document.getElementById(id);
+const video = $("video"), overlay = $("overlay"), ctx = overlay.getContext("2d");
+const stage = $("stage"), stateEl = $("state"), countEl = $("count");
+const levelEl = $("level"), msg = $("msg"), startBtn = $("start");
+
+let landmarker, running = false, pinching = false, frames = 0;
+let smooth = 1, shots = 0, lastShot = 0, lastVideoTime = -1;
+
+const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y); // 2D, как советовали
+
+async function init() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  const make = delegate => HandLandmarker.createFromOptions(fileset, {
+    baseOptions: {
+      modelAssetPath: "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate
+    },
+    runningMode: "VIDEO",
+    numHands: 1
+  });
+  try { landmarker = await make("GPU"); }
+  catch (e) { landmarker = await make("CPU"); }
+}
+
+async function start() {
+  startBtn.disabled = true;
+  msg.textContent = "Загружаю модель, подождите несколько секунд…";
+  try {
+    if (!landmarker) await init();
+    const stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: "user", width: { ideal: 640 }, height: { ideal: 480 } },
+      audio: false
+    });
+    video.srcObject = stream;
+    await video.play();
+    overlay.width = video.videoWidth; overlay.height = video.videoHeight;
+    running = true;
+    startBtn.style.display = "none";
+    msg.textContent = "Держите руку целиком в кадре.";
+    stateEl.textContent = "Рука не найдена";
+    loop();
+  } catch (e) {
+    startBtn.disabled = false;
+    msg.textContent = "Не получилось: " + (e.name === "NotAllowedError"
+      ? "разрешите доступ к камере в настройках браузера."
+      : e.message);
+  }
+}
+
+function loop() {
+  if (!running) return;
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    handle(res.landmarks && res.landmarks[0]);
+  }
+  requestAnimationFrame(loop);
+}
+
+function handle(hand) {
+  ctx.clearRect(0, 0, overlay.width, overlay.height);
+  if (!hand) {
+    stateEl.textContent = "Рука не найдена";
+    levelEl.style.width = "0";
+    setPinch(false); frames = 0;
+    return;
+  }
+  draw(hand);
+
+  const palm = dist(hand[0], hand[9]);
+  const ratio = dist(hand[4], hand[8]) / palm;
+  smooth = 0.4 * ratio + 0.6 * smooth;
+
+  // Аналоговая шкала: 0 = пальцы разведены, 100% = сжаты
+  const k = 1 - Math.min(Math.max((smooth - PINCH_ON) / (0.9 - PINCH_ON), 0), 1);
+  levelEl.style.width = (k * 100).toFixed(0) + "%";
+
+  if (!pinching) {
+    frames = ratio < PINCH_ON ? frames + 1 : 0;
+    if (frames >= CONFIRM_FRAMES) { setPinch(true); onPinchStart(); }
+  } else if (ratio > PINCH_OFF) {
+    setPinch(false); frames = 0;
+  }
+  stateEl.textContent = (pinching ? "Щепотка" : "Рука открыта") + " · " + ratio.toFixed(2);
+}
+
+function setPinch(v) {
+  pinching = v;
+  stage.classList.toggle("pinch", v);
+}
+
+// ===== Что происходит по щепотке =====
+function onPinchStart() {
+  const now = performance.now();
+  if (now - lastShot < COOLDOWN_MS) return;
+  lastShot = now;
+  if (navigator.vibrate) navigator.vibrate(40);
+  snapshot();
+}
+
+function snapshot() {
+  const c = document.createElement("canvas");
+  c.width = video.videoWidth; c.height = video.videoHeight;
+  const g = c.getContext("2d");
+  g.translate(c.width, 0); g.scale(-1, 1);       // зеркалим как на экране
+  g.drawImage(video, 0, 0);
+  const img = new Image();
+  img.src = c.toDataURL("image/jpeg", 0.85);
+  $("gallery").prepend(img);
+  countEl.textContent = "Снимков: " + (++shots);
+  const f = $("flash"); f.classList.remove("on"); void f.offsetWidth; f.classList.add("on");
+}
+// =====================================
+
+function draw(hand) {
+  const w = overlay.width, h = overlay.height;
+  ctx.fillStyle = "#5aa8ff";
+  for (const p of hand) { ctx.beginPath(); ctx.arc(p.x * w, p.y * h, 4, 0, 7); ctx.fill(); }
+  ctx.strokeStyle = pinching ? "#4ad6a7" : "#ffffff"; ctx.lineWidth = 4;
+  ctx.beginPath();
+  ctx.moveTo(hand[4].x * w, hand[4].y * h);
+  ctx.lineTo(hand[8].x * w, hand[8].y * h);
+  ctx.stroke();
+}
+
+startBtn.addEventListener("click", start);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && running) { lastVideoTime = -1; }
+});
+</script>
+</body>
+</html>
